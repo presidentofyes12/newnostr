@@ -33,6 +33,8 @@ services:
       - PASSWORD=your_secure_password
     networks:
       - odoo_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 networks:
   odoo_network:

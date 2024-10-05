@@ -58,5 +58,5 @@ class ResUsers(models.Model):
     _inherit = 'res.users'
 
     nostr_public_key = fields.Char(string="Nostr Public Key")
-    nostr_private_key = fields.Char(string="Nostr Private Key")
+    nostr_private_key = fields.Char(string="Nostr Private Key", groups="base.group_system")
     nostr_relay_url = fields.Char(string="Nostr Relay URL")

@@ -33,6 +33,7 @@ RUN pip3 install --upgrade pip
 RUN pip3 install --no-cache-dir -r /opt/odoo/odoo/requirements.txt
 RUN pip3 install cryptography pyopenssl==22.1.0 psycopg2-binary bs4 BeautifulSoup4 gitpython bech32 websocket-client websockets
 RUN pip3 install nostr
+RUN pip3 install python-gitlab
 
 # Copy OpenEduCat addons
 RUN cp -r /opt/odoo/openeducat/* /opt/odoo/odoo/addons/

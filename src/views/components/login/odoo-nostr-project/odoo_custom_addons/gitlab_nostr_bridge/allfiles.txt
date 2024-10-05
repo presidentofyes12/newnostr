@@ -1,0 +1,1941 @@
+Not working GitLab Nostr Bridge.
+
+Home dir: ~/oldhome/home/impromise/Downloads/Telegram Desktop/nostr-w-relay-main (2)/nostr-w-relay-main (1)/src/views/components/login/odoo-nostr-project/odoo_custom_addons/gitlab_nostr_bridge/
+
+=== ./models/gitlab_commit.py ===
+from odoo import models, fields, api
+from dateutil import parser
+from datetime import datetime, timezone
+from nostr.event import Event
+import time
+import asyncio
+import json
+import logging
+
+_logger = logging.getLogger(__name__)
+
+class GitlabCommit(models.Model):
+    _name = 'gitlab.commit'
+    _description = 'GitLab Commit'
+
+    name = fields.Char(string='Commit Hash', required=True)
+    message = fields.Text(string='Commit Message')
+    author = fields.Char(string='Author')
+    date = fields.Datetime(string='Commit Date')
+    repository_id = fields.Many2one('gitlab.repository', string='Repository', required=True)
+    branch_ids = fields.Many2many('gitlab.branch', string='Branches')
+
+    @api.model
+    def create_or_update_from_gitlab(self, repository_id, gitlab_commit):
+        existing_commit = self.search([('name', '=', gitlab_commit.id), ('repository_id', '=', repository_id)])
+        commit_date = self._convert_to_naive_datetime(gitlab_commit.committed_date)
+        
+        if existing_commit:
+            existing_commit.write({
+                'message': gitlab_commit.message,
+                'author': gitlab_commit.author_name,
+                'date': commit_date,
+            })
+            commit = existing_commit
+        else:
+            commit = self.create({
+                'name': gitlab_commit.id,
+                'message': gitlab_commit.message,
+                'author': gitlab_commit.author_name,
+                'date': commit_date,
+                'repository_id': repository_id,
+            })
+
+        # Create and publish Nostr event
+        self._create_and_publish_nostr_event(commit)
+
+    def _create_and_publish_nostr_event(self, commit):
+        user = self.env.user
+        if not user.nostr_private_key:
+            _logger.error("Nostr private key is not set for the current user.")
+            return
+
+        try:
+            from nostr.key import PrivateKey
+            private_key = PrivateKey.from_nsec(user.nostr_private_key)
+            pub_key = private_key.public_key.hex()
+
+            event = Event(
+                public_key=pub_key,
+                created_at=int(time.time()),
+                kind=1,
+                tags=[],
+                content=f"New commit in repository {commit.repository_id.name}: {commit.message}"
+            )
+            private_key.sign_event(event)
+
+            relay_urls = self.env['ir.config_parameter'].sudo().get_param('nostr_bridge.relay_urls', '').split(',')
+            relay_urls = [url.strip() for url in relay_urls if url.strip()]
+
+            if not relay_urls:
+                _logger.error("No Nostr relay URLs configured.")
+                return
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            results = loop.run_until_complete(self._publish_to_relays(relay_urls, event))
+
+            successes = [result for result in results if result['success']]
+            if successes:
+                _logger.info(f"Successfully published Nostr event for commit {commit.name} to {len(successes)} relays.")
+            else:
+                _logger.error(f"Failed to publish Nostr event for commit {commit.name} to any relay.")
+
+        except Exception as e:
+            _logger.error(f"Error creating and publishing Nostr event: {str(e)}")
+
+    async def _publish_to_relays(self, relay_urls, event):
+        import websockets
+
+        async def publish_to_relay(url, event):
+            try:
+                async with websockets.connect(url.strip(), ping_interval=None) as websocket:
+                    message = event.to_message()
+                    await websocket.send(message)
+                    response = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                    return {'success': True, 'url': url, 'response': response}
+            except Exception as e:
+                return {'success': False, 'url': url, 'error': str(e)}
+
+        tasks = [publish_to_relay(url, event) for url in relay_urls]
+        return await asyncio.gather(*tasks)
+
+    def _convert_to_naive_datetime(self, date_string):
+        dt = parser.parse(date_string)
+        return dt.replace(tzinfo=None)
+=== ./models/__init__.py ===
+from . import gitlab_repository
+from . import gitlab_branch
+from . import gitlab_commit
+from . import nostr_event
+from . import res_config_settings
+from . import res_users
+=== ./models/res_users.py ===
+# -*- coding: utf-8 -*-
+
+from odoo import models, fields, api, _
+from odoo.exceptions import UserError
+from nostr.key import PrivateKey
+import secrets
+import logging
+
+_logger = logging.getLogger(__name__)
+
+class ResUsers(models.Model):
+    _inherit = 'res.users'
+
+    nostr_private_key = fields.Char(string="Nostr Private Key", copy=False)
+    nostr_public_key = fields.Char(string="Nostr Public Key", compute='_compute_nostr_public_key', store=True)
+
+    @api.depends('nostr_private_key')
+    def _compute_nostr_public_key(self):
+        for user in self:
+            if user.nostr_private_key:
+                try:
+                    private_key = PrivateKey.from_nsec(user.nostr_private_key)
+                    user.nostr_public_key = private_key.public_key.bech32()
+                except Exception as e:
+                    _logger.error(f"Error computing public key for user {user.id}: {str(e)}")
+                    user.nostr_public_key = False
+            else:
+                user.nostr_public_key = False
+
+    @api.model
+    def create(self, vals):
+        if 'nostr_private_key' not in vals:
+            vals['nostr_private_key'] = self._generate_nostr_key()
+        return super(ResUsers, self).create(vals)
+
+    def _generate_nostr_key(self):
+        private_key = PrivateKey()
+        return private_key.bech32()
+
+    def action_generate_nostr_key(self):
+        self.ensure_one()
+        private_key = PrivateKey()
+        self.nostr_private_key = private_key.bech32()
+        self._compute_nostr_public_key()
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': _("Nostr Key Generated"),
+                'message': _("A new Nostr key pair has been generated."),
+                'type': 'success',
+                'sticky': False,
+            }
+        }
+
+    def action_clear_nostr_key(self):
+        self.ensure_one()
+        self.nostr_private_key = False
+        self._compute_nostr_public_key()
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': _("Nostr Key Cleared"),
+                'message': _("The Nostr key pair has been cleared."),
+                'type': 'warning',
+                'sticky': False,
+            }
+        }
+=== ./models/nostr_event.py ===
+# -*- coding: utf-8 -*-
+
+import abc
+from functools import wraps
+import json
+import logging
+import time
+import asyncio
+import websockets
+from odoo import models, fields, api, _
+from odoo.exceptions import UserError
+from nostr.event import Event
+from nostr.key import PrivateKey, PublicKey
+from nostr.relay_manager import RelayManager
+from nostr.message_type import ClientMessageType
+from bech32 import bech32_decode, convertbits
+import ssl
+
+_logger = logging.getLogger(__name__)
+
+# ---- Decorator Pattern ----
+
+def enhanced_publish_event(func):
+    """
+    Decorator to enhance the publish_event method.
+    It adds logging and error handling capabilities.
+    """
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        _logger.info(f"Starting publish action for event: {self.event_id}")
+        start_time = time.time()
+
+        try:
+            result = func(self, *args, **kwargs)
+            
+            end_time = time.time()
+            _logger.info(f"Total publish action time: {end_time - start_time:.2f} seconds")
+            
+            return result
+        except Exception as e:
+            _logger.error(f"Error in publish_event: {str(e)}", exc_info=True)
+            return {
+                'type': 'ir.actions.client',
+                'tag': 'display_notification',
+                'params': {
+                    'title': _("Error"),
+                    'message': _("An unexpected error occurred: %s") % str(e),
+                    'type': 'danger',
+                    'sticky': True,
+                }
+            }
+    return wrapper
+
+# ---- Strategy Pattern ----
+
+class PublishStrategy(abc.ABC):
+    """
+    Abstract base class for publish strategies.
+    Concrete strategies should implement the publish method.
+    """
+    @abc.abstractmethod
+    def publish(self, event):
+        pass
+
+class OriginalPublishStrategy(PublishStrategy):
+    """
+    Original publishing strategy using existing logic.
+    """
+    def publish(self, event):
+        relay_manager = RelayManager(event.env)
+        relay_urls = relay_manager.relay_urls[:5]  # Get the first 5 URLs
+
+        if not relay_urls:
+            return event._return_notification("Configuration Error", "No Nostr relay URLs configured.", "warning")
+
+        nostr_event = event._create_nostr_event()
+        signed_event = event._sign_event(nostr_event)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            success = loop.run_until_complete(relay_manager.publish_to_relays(signed_event, [{'url': url} for url in relay_urls]))
+        finally:
+            loop.close()
+
+        if success:
+            event.write({
+                'event_id': signed_event.id,
+                'signature': signed_event.signature,
+                'published': True,
+                'logs': f"Event published to relays: {', '.join(relay_urls)}"
+            })
+            return event._return_notification("Success", "Nostr event published successfully.", "success")
+        else:
+            return event._return_notification("Publishing Failed", "Failed to publish Nostr event.", "danger", sticky=True)
+
+class AlternativePublishStrategy(PublishStrategy):
+    """
+    Alternative publishing strategy with enhanced error handling and SSL options.
+    """
+    def publish(self, event):
+        relay_manager = RelayManager(event.env)
+        relay_urls = relay_manager.relay_urls[:5]  # Get the first 5 URLs
+
+        if not relay_urls:
+            return event._return_notification("Configuration Error", "No Nostr relay URLs configured.", "warning")
+
+        nostr_event = event._create_nostr_event()
+        signed_event = event._sign_event(nostr_event)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            success_rate = loop.run_until_complete(relay_manager.publish_to_relays(signed_event, [{'url': url} for url in relay_urls]))
+        finally:
+            loop.close()
+
+        if success_rate > 0:
+            event.write({
+                'event_id': signed_event.id,
+                'signature': signed_event.signature,
+                'published': True,
+                'logs': f"Event published to relays with {success_rate:.2f} success rate: {', '.join(relay_urls)}"
+            })
+            return event._return_notification("Success", f"Nostr event published successfully with {success_rate:.2f} success rate.", "success")
+        else:
+            return event._return_notification("Publishing Failed", "Failed to publish Nostr event to any relay.", "danger", sticky=True)
+
+class AsyncPublishStrategy(PublishStrategy):
+    """
+    Async publishing strategy with enhanced error handling and parallel publishing.
+    """
+    async def publish_to_relay(self, url, message):
+        try:
+            async with websockets.connect(url, close_timeout=30) as websocket:
+                await websocket.send(message)
+                response = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+                return {'success': True, 'url': url, 'response': response}
+        except websockets.WebSocketException as e:
+            return {'success': False, 'url': url, 'error': f"WebSocket error: {str(e)}"}
+        except Exception as e:
+            return {'success': False, 'url': url, 'error': f"General error: {str(e)}"}
+
+    async def _publish_to_relays(self, relay_urls, event_message):
+        tasks = [self.publish_to_relay(url, event_message) for url in relay_urls]
+        results = await asyncio.gather(*tasks)
+        
+        # Log detailed errors for each failed relay
+        for result in results:
+            if not result['success']:
+                _logger.error(f"Failed to publish to {result['url']}: {result['error']}")
+
+        # Determine if at least one relay succeeded
+        success = any(result['success'] for result in results)
+        return success
+
+    def publish(self, event):
+        try:
+            # Prepare event data
+            nostr_event = event._create_nostr_event()
+            signed_event = event._sign_event(nostr_event)
+            event_message = json.dumps([ClientMessageType.EVENT, signed_event.to_dict()])
+            
+            # Get relay URLs from configuration
+            relay_urls = event.env['ir.config_parameter'].sudo().get_param('nostr_bridge.relay_urls', '').split(',')
+            relay_urls = [url.strip() for url in relay_urls if url.strip()]
+            
+            if not relay_urls:
+                return event._return_notification("Configuration Error", "No Nostr relay URLs configured.", "warning")
+            
+            # Use asyncio to run the publishing process
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            success = loop.run_until_complete(self._publish_to_relays(relay_urls, event_message))
+            
+            if success:
+                event.write({
+                    'event_id': signed_event.id,
+                    'signature': signed_event.signature,
+                    'published': True,
+                    'logs': f"Event published to relays: {', '.join(relay_urls)}"
+                })
+                return event._return_notification("Success", "Event published successfully.", "success")
+            else:
+                return event._return_notification("Failed", "Failed to publish the event to any relay.", "danger", sticky=True)
+        except Exception as e:
+            _logger.error(f"Error in publish_event: {str(e)}", exc_info=True)
+            return event._return_notification("Error", f"An unexpected error occurred: {str(e)}", "danger", sticky=True)
+
+# ---- New Relay Management System ----
+
+class RelayManager:
+    def __init__(self, env):
+        self.env = env
+        self.relay_urls = self._get_relay_urls()
+        self.successful_relays = []
+
+    def _get_relay_urls(self):
+        return self.env['ir.config_parameter'].sudo().get_param('nostr_bridge.relay_urls', '').split(',')
+
+    async def test_relay(self, url):
+        try:
+            async with websockets.connect(url.strip(), ping_interval=None, close_timeout=5) as websocket:
+                start_time = time.time()
+                await websocket.send(json.dumps(["REQ", "1", {"kinds": [1]}]))
+                response = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                end_time = time.time()
+                return {'url': url, 'success': True, 'response_time': end_time - start_time}
+        except Exception as e:
+            return {'url': url, 'success': False, 'error': str(e)}
+
+    async def test_relays(self):
+        tasks = [self.test_relay(url) for url in self.relay_urls]
+        results = await asyncio.gather(*tasks)
+        self.successful_relays = [result for result in results if result['success']]
+        self.successful_relays.sort(key=lambda x: x['response_time'])
+        return self.successful_relays[:108]  # Limit to 108 successful relays
+
+    def select_best_relays(self, n=9):
+        return self.successful_relays[:n]
+
+    async def publish_to_relay(self, url, event):
+        try:
+            async with websockets.connect(url, close_timeout=10) as websocket:
+                message = json.dumps(["EVENT", event.to_dict()])
+                await websocket.send(message)
+                response = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                return {'url': url, 'success': True, 'response': response}
+        except Exception as e:
+            return {'url': url, 'success': False, 'error': str(e)}
+
+    async def publish_to_relays(self, event, relays):
+        tasks = [self.publish_to_relay(relay['url'], event) for relay in relays]
+        results = await asyncio.gather(*tasks)
+        success_count = sum(1 for result in results if result['success'])
+        return success_count / len(relays)
+
+    async def manage_relay_list(self, event):
+        await self.test_relays()
+        relays_to_use = self.select_best_relays()
+        success_rate = await self.publish_to_relays(event, relays_to_use)
+        
+        attempts = 1
+        while success_rate < 0.5 and attempts < 12:  # 12 attempts cover all 108 relays
+            _logger.warning(f"Low success rate ({success_rate:.2f}). Trying next set of relays.")
+            relays_to_use = self.select_best_relays(n=9*attempts)[-9:]
+            success_rate = await self.publish_to_relays(event, relays_to_use)
+            attempts += 1
+
+        if success_rate < 0.5:
+            _logger.error("Failed to achieve 50% success rate after trying all relays.")
+            return False
+        
+        successful_urls = [relay['url'] for relay in self.successful_relays[:108]]
+        self.env['ir.config_parameter'].sudo().set_param('nostr_bridge.successful_relays', ','.join(successful_urls))
+        return True
+
+# ---- Main NostrEvent Model ----
+
+class NostrEvent(models.Model):
+    _name = 'nostr.event'
+    _description = 'Nostr Event'
+
+    event_id = fields.Char(string='Event ID', required=False)
+    kind = fields.Integer(string='Event Kind', required=True)
+    content = fields.Text(string='Content', required=True)
+    tags = fields.Text(string='Tags')
+    public_key = fields.Char(string='Public Key', required=True)
+    created_at = fields.Integer(string='Created At', required=False)
+    signature = fields.Char(string='Signature', required=False)
+    published = fields.Boolean(string='Published', default=False)
+    logs = fields.Text(string='Logs')
+
+    @api.model
+    def default_get(self, fields):
+        res = super(NostrEvent, self).default_get(fields)
+        if 'event_id' not in res or 'signature' not in res:
+            res.update({
+                'content': res.get('content', ''),
+                'public_key': res.get('public_key', self.env.user.nostr_public_key),
+                'kind': res.get('kind', 1),
+                'tags': json.dumps(res.get('tags', [])),
+                'created_at': int(time.time()),
+            })
+        return res
+
+    @api.model
+    def create(self, vals):
+        record = super(NostrEvent, self).create(vals)
+        if not record.event_id or not record.signature:
+            record.generate_event_id_and_signature()
+        return record
+
+    def write(self, vals):
+        result = super(NostrEvent, self).write(vals)
+        for record in self:
+            if not record.event_id or not record.signature:
+                record.generate_event_id_and_signature()
+        return result
+
+    def _ensure_private_key(self):
+        if not self.env.user.nostr_private_key:
+            raise UserError(_("Nostr private key is not set for the current user. Please set it in your user preferences."))
+        return self.env.user.nostr_private_key
+
+    def _get_private_key(self):
+        key = self._ensure_private_key()
+        if not isinstance(key, str):
+            raise TypeError(f"Invalid Nostr private key type. Expected string, got {type(key)}")
+        if key.startswith('nsec'):
+            return PrivateKey.from_nsec(key)
+        elif len(key) == 64:  # It's already a hex key
+            return PrivateKey(bytes.fromhex(key))
+        else:
+            raise ValueError("Invalid private key format")
+
+    def generate_event_id_and_signature(self):
+        _logger.info(f"Generating event ID and signature for event: {self.id}")
+        content = self.content or ''
+        pub_key = self.public_key or self.env.user.nostr_public_key
+        created_at = self.created_at or int(time.time())
+        kind = self.kind or 1
+        tags = json.loads(self.tags or '[]')
+
+        event = Event(
+            content=content,
+            public_key=pub_key,
+            created_at=created_at,
+            kind=kind,
+            tags=tags
+        )
+
+        try:
+            private_key = self._get_private_key()
+            private_key.sign_event(event)
+            _logger.info(f"Successfully signed event: {event.id}")
+        except Exception as e:
+            _logger.error(f"Failed to sign event: {str(e)}")
+            event.id = Event.compute_id(pub_key, created_at, kind, tags, content)
+            event.signature = 'dummy_signature_for_testing'
+
+        self.write({
+            'event_id': event.id,
+            'signature': event.signature,
+            'created_at': created_at,
+            'public_key': pub_key
+        })
+
+    @enhanced_publish_event
+    def publish_event(self):
+        """
+        Publish the Nostr event using the appropriate strategy based on feature flags.
+        This method is enhanced with the @enhanced_publish_event decorator for additional logging and error handling.
+        """
+        strategy = self._get_publish_strategy()
+        if callable(strategy):
+            return strategy()
+        else:
+            return strategy.publish(self)
+
+    def _get_publish_strategy(self):
+        """
+        Determine which publish strategy to use based on the feature flags.
+        """
+        if self.env['ir.config_parameter'].sudo().get_param('use_new_relay_management', 'False') == 'True':
+            return self._new_relay_management_publish
+        elif self.env['ir.config_parameter'].sudo().get_param('use_async_publish', 'False') == 'True':
+            return AsyncPublishStrategy()
+        elif self.env['ir.config_parameter'].sudo().get_param('use_alternative_publish', 'False') == 'True':
+            return AlternativePublishStrategy()
+        else:
+            return OriginalPublishStrategy()
+
+    def _new_relay_management_publish(self):
+        """
+        New publish method using the improved relay management system.
+        """
+        relay_manager = RelayManager(self.env)
+        event = self._create_nostr_event()
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            success = loop.run_until_complete(relay_manager.manage_relay_list(event))
+        finally:
+            loop.close()
+        
+        if success:
+            self.write({
+                'published': True,
+                'logs': "Event published successfully using new relay management system."
+            })
+            return self._return_notification("Success", "Nostr event published successfully.", "success")
+        else:
+            return self._return_notification("Publishing Failed", "Failed to publish Nostr event using new relay management system.", "danger", sticky=True)
+
+    def _create_nostr_event(self):
+        """
+        Create a Nostr event from the current record data.
+        """
+        return Event(
+            content=self.content,
+            public_key=bech32_to_hex(self.public_key),
+            created_at=self.created_at or int(time.time()),
+            kind=self.kind,
+            tags=json.loads(self.tags) if self.tags else []
+        )
+
+    def _sign_event(self, event):
+        """
+        Sign the given Nostr event using the private key.
+        """
+        private_key = self._get_private_key()
+        private_key.sign_event(event)
+        return event
+
+    def _return_notification(self, title, message, type, sticky=False):
+        """
+        Helper method to return a notification action.
+        """
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': _(title),
+                'message': _(message),
+                'type': type,
+                'sticky': sticky,
+            }
+        }
+
+    @api.model
+    def create_gitlab_event(self, event_type, data):
+        content = json.dumps(data)
+        
+        user_public_key = self.env.user.nostr_public_key
+        if not user_public_key:
+            raise UserError(_("Nostr public key is not set for the current user."))
+        
+        user_public_key_hex = bech32_to_hex(user_public_key)
+    
+        event_data = {
+            'content': content,
+            'pubkey': user_public_key_hex,
+            'created_at': int(time.time()),
+            'kind': self._get_event_kind(event_type),
+            'tags': [['p', user_public_key_hex]],
+        }
+        
+        event = self.create_nostr_event(event_data)
+        
+        _logger.info(f"Created Nostr event: {event.to_message()}")
+        
+        signed_event = self.sign_event(event)
+        
+        _logger.info(f"Signed Nostr event: {signed_event.to_message()}")
+        
+        return self.create_and_publish(signed_event)
+
+    def create_nostr_event(self, event_data):
+        event = Event(
+            content=event_data['content'],
+            public_key=event_data['pubkey'],
+            created_at=int(time.time()),
+            kind=event_data['kind'],
+            tags=json.loads(event_data['tags']) if isinstance(event_data['tags'], str) else event_data['tags']
+        )
+        return event
+
+    def sign_event(self, event):
+        private_key = self._get_private_key()
+        private_key.sign_event(event)
+        return event
+
+    def _get_event_kind(self, event_type):
+        event_kinds = {
+            'commit': 3121,
+            'branch': 31227,
+            'merge_request': 31228,
+        }
+        return event_kinds.get(event_type, 1)
+
+    def _get_event_tags(self, event_type, data):
+        tags = []
+        if event_type == 'commit':
+            tags.extend([['p', data['project_id']], ['c', data['commit_id']]])
+        elif event_type == 'branch':
+            tags.extend([['p', data['project_id']], ['b', data['branch_name']]])
+        elif event_type == 'merge_request':
+            tags.extend([['p', data['project_id']], ['mr', data['merge_request_id']]])
+        return tags
+
+    def create_and_publish(self, event):
+        nostr_event = self.create({
+            'event_id': event.id,
+            'kind': event.kind,
+            'content': event.content,
+            'tags': json.dumps(event.tags),
+            'public_key': event.public_key,
+            'created_at': event.created_at,
+            'signature': event.signature,
+        })
+        
+        if nostr_event.publish_event():
+            _logger.info(f"Successfully published Nostr event: {event.id}")
+        else:
+            _logger.warning(f"Failed to publish Nostr event: {event.id}")
+        
+        return nostr_event
+
+    def action_publish(self):
+        self.ensure_one()
+        return self.publish_event()
+
+    @api.model
+    def process_incoming_events(self):
+        relay_urls = self.env['ir.config_parameter'].sudo().get_param('nostr_bridge.relay_urls', '').split(',')
+        relay_urls = [url.strip() for url in relay_urls if url.strip()]
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._listen_to_relays(relay_urls))
+        finally:
+            loop.close()
+
+    async def _listen_to_relays(self, relay_urls):
+        async def listen_to_relay(url):
+            try:
+                async with websockets.connect(url) as websocket:
+                    subscription_id = "my_subscription"
+                    await websocket.send(json.dumps(["REQ", subscription_id, {}]))
+                    while True:
+                        response = await websocket.recv()
+                        event = json.loads(response)
+                        if event[0] == "EVENT" and event[1] == subscription_id:
+                            self._process_event(event[2])
+            except Exception as e:
+                _logger.error(f"Error listening to relay {url}: {str(e)}")
+
+        await asyncio.gather(*[listen_to_relay(url) for url in relay_urls])
+
+    async def verify_event_publication(self, event_id, relay_urls):
+        async def check_relay(url):
+            try:
+                async with websockets.connect(url, timeout=30) as websocket:
+                    request = json.dumps(["REQ", "verify", {"ids": [event_id]}])
+                    await websocket.send(request)
+                    response = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+                    return {'url': url, 'found': event_id in response}
+            except Exception as e:
+                return {'url': url, 'error': str(e)}
+    
+        tasks = [check_relay(url) for url in relay_urls]
+        results = await asyncio.gather(*tasks)
+        return results
+
+    def _process_event(self, event_data):
+        existing_event = self.search([('event_id', '=', event_data['id'])])
+        if not existing_event:
+            self.create({
+                'event_id': event_data['id'],
+                'kind': event_data['kind'],
+                'content': event_data['content'],
+                'tags': json.dumps(event_data['tags']),
+                'public_key': event_data['pubkey'],
+                'created_at': event_data['created_at'],
+                'signature': event_data['sig'],
+                'published': True,
+            })
+        else:
+            pass
+
+    def action_generate_id_and_signature(self):
+        self.ensure_one()
+        _logger.info(f"Manually generating ID and signature for event: {self.id}")
+        self.generate_event_id_and_signature()
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': _("Event Updated"),
+                'message': _("Event ID and Signature have been generated."),
+                'type': 'success',
+                'sticky': False,
+            }
+        }
+
+    def validate_event(self):
+        self.ensure_one()
+        try:
+            event = Event.from_dict(json.loads(self.to_json()))
+            is_valid = event.verify()
+            if is_valid:
+                _logger.info(f"Event {self.event_id} is valid")
+                return True
+            else:
+                _logger.warning(f"Event {self.event_id} is not valid")
+                return False
+        except Exception as e:
+            _logger.error(f"Error validating event {self.event_id}: {str(e)}")
+            return False
+
+    def to_json(self):
+        return json.dumps({
+            'id': self.event_id,
+            'pubkey': self.public_key,
+            'created_at': self.created_at,
+            'kind': self.kind,
+            'tags': json.loads(self.tags or '[]'),
+            'content': self.content,
+            'sig': self.signature
+        })
+
+# ---- Feature Flag Configuration ----
+
+class ResConfigSettings(models.TransientModel):
+    _inherit = 'res.config.settings'
+
+    use_async_publish = fields.Boolean(
+        string="Use Async Publish Method",
+        config_parameter='use_async_publish'
+    )
+    use_alternative_publish = fields.Boolean(
+        string="Use Alternative Publish Method", 
+        config_parameter='use_alternative_publish'
+    )
+    use_new_relay_management = fields.Boolean(
+        string="Use New Relay Management System",
+        config_parameter='use_new_relay_management'
+    )
+
+# ---- Utility Functions ----
+
+def bech32_to_hex(bech32_key):
+    try:
+        if bech32_key.startswith('npub'):
+            return PublicKey.from_npub(bech32_key).hex()
+        return bech32_key  # Assume it's already hex if not npub
+    except Exception as e:
+        raise ValueError(f"Invalid public key format: {str(e)}")
+
+# ---- Cron Job for Relay Testing ----
+
+class NostrRelayTester(models.Model):
+    _name = 'nostr.relay.tester'
+    _description = 'Nostr Relay Tester'
+
+    @api.model
+    def _test_and_update_relays(self):
+        relay_manager = RelayManager(self.env)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            successful_relays = loop.run_until_complete(relay_manager.test_relays())
+            successful_urls = [relay['url'] for relay in successful_relays]
+            self.env['ir.config_parameter'].sudo().set_param('nostr_bridge.successful_relays', ','.join(successful_urls))
+            _logger.info(f"Updated successful relays: {len(successful_urls)} relays")
+        finally:
+            loop.close()
+           
+=== ./models/gitlab_branch.py ===
+from odoo import models, fields, api
+from dateutil import parser
+from datetime import datetime, timezone
+
+class GitlabBranch(models.Model):
+    _name = 'gitlab.branch'
+    _description = 'GitLab Branch'
+
+    name = fields.Char(string='Branch Name', required=True)
+    repository_id = fields.Many2one('gitlab.repository', string='Repository', required=True)
+    last_commit_date = fields.Datetime(string='Last Commit Date')
+    commit_ids = fields.Many2many('gitlab.commit', string='Commits')
+
+    @api.model
+    def create_or_update_from_gitlab(self, repository_id, gitlab_branch):
+        existing_branch = self.search([('name', '=', gitlab_branch.name), ('repository_id', '=', repository_id)])
+        last_commit_date = self._convert_to_naive_datetime(gitlab_branch.commit['committed_date']) if gitlab_branch.commit else False
+        if existing_branch:
+            return existing_branch.write({
+                'last_commit_date': last_commit_date,
+            })
+        else:
+            return self.create({
+                'name': gitlab_branch.name,
+                'repository_id': repository_id,
+                'last_commit_date': last_commit_date,
+            })
+
+    def _convert_to_naive_datetime(self, date_string):
+        dt = parser.parse(date_string)
+        return dt.replace(tzinfo=None)
+=== ./models/res_config_settings.py ===
+# -*- coding: utf-8 -*-
+
+# Have program dynamically select 9 relays to use
+# Any relay that fails, blacklist for 9 days- if it fails after 9 days, multiply length by 9, etc.
+
+import logging
+from odoo import models, fields, api, _
+from odoo.exceptions import UserError
+import requests
+from nostr.relay_manager import RelayManager
+from nostr.event import Event
+from nostr.key import PrivateKey
+import time
+import asyncio
+import websockets
+import json
+from nostr.message_type import ClientMessageType
+
+_logger = logging.getLogger(__name__)
+
+class ResConfigSettings(models.TransientModel):
+    _inherit = 'res.config.settings'
+
+    gitlab_url = fields.Char(string="GitLab URL", config_parameter='gitlab_nostr_bridge.gitlab_url')
+    gitlab_private_token = fields.Char(string="GitLab Private Token", config_parameter='gitlab_nostr_bridge.gitlab_private_token')
+    use_alternative_publish = fields.Boolean(string="Use Alternative Publish Method", config_parameter='use_alternative_publish')
+    nostr_relay_urls = fields.Char(string="Nostr Relay URLs", config_parameter='nostr_bridge.relay_urls')
+
+    def set_values(self):
+        super(ResConfigSettings, self).set_values()
+        self.env['ir.config_parameter'].set_param('gitlab_nostr_bridge.gitlab_url', self.gitlab_url)
+        self.env['ir.config_parameter'].set_param('gitlab_nostr_bridge.gitlab_private_token', self.gitlab_private_token)
+        self.env['ir.config_parameter'].set_param('use_alternative_publish', str(self.use_alternative_publish))
+        self.env['ir.config_parameter'].set_param('nostr_bridge.relay_urls', self.nostr_relay_urls)
+
+    @api.model
+    def get_values(self):
+        res = super(ResConfigSettings, self).get_values()
+        params = self.env['ir.config_parameter'].sudo()
+        res.update(
+            gitlab_url=params.get_param('gitlab_nostr_bridge.gitlab_url', default=''),
+            gitlab_private_token=params.get_param('gitlab_nostr_bridge.gitlab_private_token', default=''),
+            use_alternative_publish=params.get_param('use_alternative_publish', default=False) == 'True',
+            nostr_relay_urls=params.get_param('nostr_bridge.relay_urls', default=''),
+        )
+        return res
+
+    def test_gitlab_connection(self):
+        self.ensure_one()
+        if not self.gitlab_url or not self.gitlab_private_token:
+            raise UserError(_("GitLab URL and Private Token must be set."))
+
+        try:
+            response = requests.get(
+                f"{self.gitlab_url.rstrip('/')}/api/v4/user",
+                headers={"Private-Token": self.gitlab_private_token},
+                timeout=10
+            )
+            response.raise_for_status()
+            return {
+                'type': 'ir.actions.client',
+                'tag': 'display_notification',
+                'params': {
+                    'title': _("Connection Successful"),
+                    'message': _("Connected to GitLab successfully."),
+                    'type': 'success',
+                    'sticky': False,
+                }
+            }
+        except requests.exceptions.RequestException as e:
+            _logger.error(f"Failed to connect to GitLab: {str(e)}")
+            raise UserError(_("Failed to connect to GitLab: %s") % str(e))
+
+    @api.onchange('use_alternative_publish')
+    def _onchange_use_alternative_publish(self):
+        if self.use_alternative_publish:
+            return {
+                'warning': {
+                    'title': _("Warning"),
+                    'message': _("Using the alternative publish method may affect the way Nostr events are sent. Please ensure your relays are compatible with this method.")
+                }
+            }
+
+    def action_clear_gitlab_token(self):
+        self.ensure_one()
+        self.gitlab_private_token = False
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': _("GitLab Token Cleared"),
+                'message': _("The GitLab private token has been cleared."),
+                'type': 'warning',
+                'sticky': False,
+            }
+        }
+
+    def test_nostr_connection(self):
+        self.ensure_one()
+        user = self.env.user
+        if not user.nostr_private_key:
+            raise UserError(_("Nostr private key is not set for the current user. Please generate it first."))
+
+        relay_urls = self.nostr_relay_urls.split(',') if self.nostr_relay_urls else []
+        if not relay_urls:
+            raise UserError(_("No Nostr relay URLs configured. Please set them in the settings."))
+
+        _logger.info(f"Starting Nostr connection test with {len(relay_urls)} relays")
+
+        try:
+            # Enable debug logging for nostr
+            logging.getLogger('nostr').setLevel(logging.DEBUG)
+
+            # Create a test event
+            private_key = PrivateKey.from_nsec(user.nostr_private_key)
+            pub_key = private_key.public_key.hex()
+            event = Event(
+                public_key=pub_key,
+                created_at=int(time.time()),
+                kind=1,
+                tags=[],
+                content="Test connection from Odoo"
+            )
+            private_key.sign_event(event)
+            _logger.info(f"Created test event with ID: {event.id}")
+
+            # Test publishing to relays
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            results = loop.run_until_complete(self._test_nostr_relays(relay_urls, event))
+
+            _logger.info(f"Raw results data: {str(results)}");
+
+            # Process results
+            successes = [result for result in results if result['success']]
+            failures = [result for result in results if not result['success']]
+
+            _logger.info(f"Test completed. Successful connections: {len(successes)}, Failed connections: {len(failures)}")
+
+            if successes:
+                message = f"Successfully connected to {len(successes)} out of {len(relay_urls)} relays."
+                if failures:
+                    message += f"\nFailed to connect to {len(failures)} relays."
+                message_type = 'warning' if failures else 'success'
+            else:
+                message = "Failed to publish the test event to any relay.\n"
+                message += "\n".join([f"{result['url']}: {result['message']}" for result in failures])
+                message_type = 'danger'
+
+            _logger.info(f"Test result message: {message}")
+
+            return {
+                'type': 'ir.actions.client',
+                'tag': 'display_notification',
+                'params': {
+                    'title': _("Test Results"),
+                    'message': message,
+                    'type': message_type,
+                    'sticky': True,
+                }
+            }
+
+        except Exception as e:
+            _logger.error(f"Error in test_nostr_connection: {str(e)}", exc_info=True)
+            return {
+                'type': 'ir.actions.client',
+                'tag': 'display_notification',
+                'params': {
+                    'title': _("Error"),
+                    'message': _("An error occurred while testing Nostr connection: %s") % str(e),
+                    'type': 'danger',
+                    'sticky': True,
+                }
+            }
+
+    async def publish_with_limit(self, semaphore, url, event):
+        async with semaphore:
+            try:
+                _logger.info(f"Attempting to connect to relay: {url}")
+                async with websockets.connect(url.strip(), ping_interval=None) as websocket:
+                    message = event.to_message()  # Use to_message() instead of to_dict()
+                    _logger.info(f"Sending message to {url}: {message[:100]}...")  # Log first 100 chars of message
+                    await websocket.send(message)
+                    _logger.info(f"Message sent to {url}, waiting for response...")
+                    response = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                    _logger.info(f"Received response from {url}: {response}")
+                    if json.loads(response)[0] == "OK":
+                        return {'success': True, 'url': url, 'message': f"Successfully published to {url}"}
+                    else:
+                        return {'success': False, 'url': url, 'message': f"Failed to publish to {url}: {response}"}
+            except Exception as e:
+                _logger.error(f"Unexpected error while connecting to {url}: {str(e)}", exc_info=True)
+                return {'success': False, 'url': url, 'message': f"Failed to publish to {url}: {str(e)}"}
+
+    async def _test_nostr_relays(self, relay_urls, event, timeout=10):
+        semaphore = asyncio.Semaphore(10)  # Limit to 10 concurrent connections
+        _logger.info(f"Testing {len(relay_urls)} relays with a concurrency limit of 10")
+        tasks = [self.publish_with_limit(semaphore, url, event) for url in relay_urls]
+        results = await asyncio.gather(*tasks)
+        _logger.info(f"Completed testing all relays")
+        return results
+=== ./models/gitlab_repository.py ===
+import logging
+from odoo.exceptions import UserError
+from odoo import _, api, fields, models
+import gitlab
+import requests
+
+_logger = logging.getLogger(__name__)
+
+class GitlabRepository(models.Model):
+    _name = 'gitlab.repository'
+    _description = 'GitLab Repository'
+
+    name = fields.Char(string='Repository Name', required=True)
+    gitlab_id = fields.Integer(string='GitLab Repository ID', required=True)
+    url = fields.Char(string='GitLab URL', required=True)
+    project_id = fields.Integer(string='GitLab Project ID', required=True)
+    branch_ids = fields.One2many('gitlab.branch', 'repository_id', string='Branches')
+    commit_ids = fields.One2many('gitlab.commit', 'repository_id', string='Commits')
+
+    def action_create_commit(self):
+        return {
+            'name': 'Create Commit',
+            'type': 'ir.actions.act_window',
+            'res_model': 'gitlab_nostr_bridge.create.commit.wizard',
+            'view_mode': 'form',
+            'target': 'new',
+        }
+
+    @api.model
+    def sync_all_repositories(self):
+        repositories = self.search([])
+        for repo in repositories:
+            repo.sync_with_gitlab()
+
+    def sync_with_gitlab(self):
+        self.ensure_one()
+        gitlab_url = self.env['ir.config_parameter'].sudo().get_param('gitlab_nostr_bridge.gitlab_url')
+        gitlab_token = self.env['ir.config_parameter'].sudo().get_param('gitlab_nostr_bridge.gitlab_private_token')
+
+        if not gitlab_url or not gitlab_token:
+            raise UserError(_("GitLab URL or Private Token is not configured. Please check the settings."))
+
+        try:
+            gl = gitlab.Gitlab(gitlab_url, private_token=gitlab_token, timeout=30)
+            gl.auth()
+            project = gl.projects.get(self.project_id)
+            
+            # Sync branches
+            for branch in project.branches.list():
+                self.env['gitlab.branch'].create_or_update_from_gitlab(self.id, branch)
+            
+            # Sync commits
+            for commit in project.commits.list():
+                self.env['gitlab.commit'].create_or_update_from_gitlab(self.id, commit)
+
+            return {
+                'type': 'ir.actions.client',
+                'tag': 'display_notification',
+                'params': {
+                    'title': _("Sync Successful"),
+                    'message': _("Repository synced successfully with GitLab."),
+                    'type': 'success',
+                    'sticky': False,
+                }
+            }
+        except Exception as e:
+            _logger.error(f"Failed to sync with GitLab: {str(e)}")
+            raise UserError(_("Failed to sync with GitLab: %s") % str(e))
+
+    @api.model
+    def create(self, vals):
+        repo = super(GitlabRepository, self).create(vals)
+        gitlab_url = self.env['ir.config_parameter'].sudo().get_param('gitlab_nostr_bridge.gitlab_url')
+        gitlab_token = self.env['ir.config_parameter'].sudo().get_param('gitlab_nostr_bridge.gitlab_private_token')
+
+        if not gitlab_url or not gitlab_token:
+            raise UserError(_("GitLab URL or Private Token is not configured. Please check the settings."))
+
+        _logger.info(f"Attempting to connect to GitLab at {gitlab_url}")
+
+        try:
+            gl = gitlab.Gitlab(gitlab_url, private_token=gitlab_token, timeout=10)
+            gl.auth()
+            _logger.info("Successfully authenticated with GitLab")
+        except gitlab.exceptions.GitlabAuthenticationError:
+            _logger.error("GitLab authentication failed")
+            raise UserError(_("Failed to authenticate with GitLab. Please check your GitLab private token."))
+        except requests.exceptions.RequestException as e:
+            _logger.error(f"Failed to connect to GitLab: {str(e)}")
+            raise UserError(_("Failed to connect to GitLab. Please check the GitLab URL and your network connection."))
+        except Exception as e:
+            _logger.error(f"Unexpected error when connecting to GitLab: {str(e)}")
+            raise UserError(_("An unexpected error occurred: %s") % str(e))
+
+        try:
+            project = gl.projects.get(repo.project_id)
+            _logger.info(f"Successfully retrieved GitLab project: {project.name}")
+        except gitlab.exceptions.GitlabGetError:
+            _logger.info(f"Project not found. Attempting to create new project: {repo.name}")
+            try:
+                project = gl.projects.create({'name': repo.name})
+                repo.write({'project_id': project.id})
+                _logger.info(f"Successfully created GitLab project: {project.name}")
+            except gitlab.exceptions.GitlabCreateError as e:
+                _logger.error(f"Failed to create GitLab project: {str(e)}")
+                raise UserError(_("Failed to create GitLab project. Error: %s") % str(e))
+
+        return repo
+=== ./__init__.py ===
+from . import models
+from . import wizards
+=== ./wizards/create_commit_wizard_views.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_create_commit_wizard_form" model="ir.ui.view">
+        <field name="name">gitlab_nostr_bridge.create.commit.wizard.form</field>
+        <field name="model">gitlab_nostr_bridge.create.commit.wizard</field>
+        <field name="arch" type="xml">
+            <form string="Create Commit">
+                <group>
+                    <field name="repository_id" readonly="1"/>
+                    <field name="branch_name"/>
+                    <field name="file_upload" widget="binary" filename="file_name"/>
+                    <field name="file_name" invisible="1"/>
+                    <field name="file_path" required="1" placeholder="/path/to/your/file.txt"/>
+                    <field name="file_exists" invisible="1"/>
+                    <field name="commit_message" required="1" placeholder="Enter your commit message here"/>
+                    <field name="file_content" widget="ace" options="{'mode': 'text'}" placeholder="Enter or paste your file content here" attrs="{'readonly': [('file_exists', '=', True)]}"/>
+                </group>
+                <footer>
+                    <button name="action_create_commit" string="Create Commit" type="object" class="btn-primary"/>
+                    <button string="Cancel" class="btn-secondary" special="cancel"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_create_commit_wizard" model="ir.actions.act_window">
+        <field name="name">Create Commit</field>
+        <field name="res_model">gitlab_nostr_bridge.create.commit.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+        <field name="view_id" ref="view_create_commit_wizard_form"/>
+    </record>
+</odoo>
+=== ./wizards/__init__.py ===
+from . import create_branch_wizard
+from . import create_commit_wizard
+=== ./wizards/create_commit_wizard.py ===
+# wizards/create_commit_wizard.py
+
+from odoo import models, fields, api, _
+from odoo.exceptions import UserError
+import gitlab
+import base64
+import logging
+from bech32 import bech32_decode, convertbits
+
+_logger = logging.getLogger(__name__)
+
+class CreateCommitWizard(models.TransientModel):
+    _name = 'gitlab_nostr_bridge.create.commit.wizard'
+    _description = 'Create Commit Wizard'
+
+    repository_id = fields.Many2one('gitlab.repository', string='Repository', required=True)
+    branch_name = fields.Char(string='Branch Name', required=True, default='main')
+    commit_message = fields.Text(string='Commit Message', required=True)
+    file_path = fields.Char(string='File Path', required=True)
+    file_content = fields.Text(string='File Content', required=True)
+    file_upload = fields.Binary(string='Upload File')
+    is_new_file = fields.Boolean(string='Is New File', default=True)
+    file_exists = fields.Boolean(string='File Exists', compute='_compute_file_exists')
+    file_name = fields.Char(string='File Name')
+
+    @api.depends('repository_id', 'branch_name', 'file_path')
+    def _compute_file_exists(self):
+        for record in self:
+            record.file_exists = False
+            if record.repository_id and record.branch_name and record.file_path:
+                try:
+                    gl = record._get_gitlab_client()
+                    project = gl.projects.get(record.repository_id.project_id)
+                    _logger.info(f"Checking file existence: repo={record.repository_id.name}, branch={record.branch_name}, path={record.file_path}")
+                    try:
+                        project.files.get(file_path=record.file_path, ref=record.branch_name)
+                        record.file_exists = True
+                        _logger.info(f"File exists: {record.file_path}")
+                    except gitlab.exceptions.GitlabGetError as e:
+                        if e.response_code == 404:
+                            _logger.info(f"File does not exist: {record.file_path}")
+                        else:
+                            _logger.error(f"GitLab API error: {str(e)}")
+                except Exception as e:
+                    _logger.error(f"Error checking file existence: {str(e)}")
+
+
+    @api.model
+    def default_get(self, fields_list):
+        defaults = super(CreateCommitWizard, self).default_get(fields_list)
+        active_id = self._context.get('active_id')
+        if active_id:
+            repository = self.env['gitlab.repository'].browse(active_id)
+            defaults['repository_id'] = repository.id
+            defaults['branch_name'] = 'main'  # Set default branch to 'main'
+        return defaults
+
+    @api.depends('repository_id')
+    def _get_branch_selection(self):
+        _logger.info("_get_branch_selection called")
+        branches = []
+        repository_id = self._context.get('default_repository_id')
+        if self:  # Check if self is not empty
+            repository = self.env['gitlab.repository'].browse(repository_id)
+            _logger.info(f"Repository: {repository}")
+            if repository:
+                try:
+                    gl = self._get_gitlab_client()
+                    project = gl.projects.get(repository.project_id)
+                    branches = [(branch.name, branch.name) for branch in project.branches.list()]
+                    _logger.info(f"Retrieved branches for repository {repository.name}: {branches}")
+                except Exception as e:
+                    _logger.error(f"Failed to fetch branches for repository {repository.name}: {str(e)}")
+        if not branches:
+            branches = [('main', 'main')]  # Provide a default option
+        _logger.info(f"Returning branches: {branches}")
+        return branches
+
+    @api.onchange('repository_id', 'branch_name', 'file_path')
+    def _onchange_file_details(self):
+        if self.repository_id and self.branch_name and self.file_path:
+            if not self.file_path or '..' in self.file_path:
+                return {'warning': {'title': _("Invalid File Path"), 'message': _("Please enter a valid file path.")}}
+            
+            try:
+                gl = self._get_gitlab_client()
+                project = gl.projects.get(self.repository_id.project_id)
+                _logger.info(f"Fetching file content: repo={self.repository_id.name}, branch={self.branch_name}, path={self.file_path}")
+                try:
+                    file_content = project.files.get(file_path=self.file_path, ref=self.branch_name)
+                    self.file_content = base64.b64decode(file_content.content).decode('utf-8')
+                    self.is_new_file = False
+                    _logger.info(f"File content fetched successfully: {self.file_path}")
+                except gitlab.exceptions.GitlabGetError as e:
+                    if e.response_code == 404:
+                        self.file_content = ''
+                        self.is_new_file = True
+                        _logger.info(f"File not found, treating as new file: {self.file_path}")
+                    else:
+                        _logger.error(f"GitLab API error: {str(e)}")
+                        return {'warning': {'title': _("GitLab Error"), 'message': str(e)}}
+            except Exception as e:
+                _logger.error(f"Error fetching file content: {str(e)}")
+                return {'warning': {'title': _("Error"), 'message': str(e)}}
+
+    @api.onchange('file_upload')
+    def _onchange_file_upload(self):
+        if self.file_upload:
+            self.file_content = base64.b64decode(self.file_upload).decode('utf-8')
+
+    """@api.onchange('file_name')
+    def _onchange_file_name(self):
+        if self.file_name and not self.file_path:
+            self.file_path = self.file_name"""
+
+    @api.onchange('repository_id')
+    def _onchange_repository_id(self):
+        if self.repository_id:
+            return {'domain': {'branch_name': []}, 'context': {'default_repository_id': self.repository_id.id}}
+
+    def _get_gitlab_client(self):
+        gitlab_url = self.env['ir.config_parameter'].sudo().get_param('gitlab_nostr_bridge.gitlab_url')
+        gitlab_token = self.env['ir.config_parameter'].sudo().get_param('gitlab_nostr_bridge.gitlab_private_token')
+        _logger.info(f"Creating GitLab client for URL: {gitlab_url}")
+        if not gitlab_url or not gitlab_token:
+            raise UserError(_("GitLab URL or Private Token is not configured. Please check the settings."))
+        try:
+            return gitlab.Gitlab(gitlab_url, private_token=gitlab_token)
+        except Exception as e:
+            _logger.error(f"Failed to create GitLab client: {str(e)}")
+            raise UserError(_("Failed to connect to GitLab. Please check your settings and network connection."))
+
+    @api.constrains('file_path')
+    def _check_file_path(self):
+        for record in self:
+            if not record.file_path or '..' in record.file_path:
+                raise UserError(_("Invalid file path. Please provide a valid path without '..'"))
+
+    def action_create_commit(self):
+        self.ensure_one()
+        gl = self._get_gitlab_client()
+        project = gl.projects.get(self.repository_id.project_id)
+        
+        action = 'create' if self.is_new_file else 'update'
+        
+        commit_data = {
+            'branch': self.branch_name,
+            'commit_message': self.commit_message,
+            'actions': [
+                {
+                    'action': action,
+                    'file_path': self.file_path,
+                    'content': self.file_content,
+                }
+            ]
+        }
+        
+        try:
+            commit = project.commits.create(commit_data)
+        except gitlab.exceptions.GitlabCreateError as e:
+            raise UserError(_("Failed to create commit: %s") % str(e))
+        
+        self.env['gitlab.commit'].create_or_update_from_gitlab(self.repository_id.id, commit)
+        
+        try:
+            self.env['nostr.event'].create_gitlab_event('commit', {
+                'project_id': self.repository_id.project_id,
+                'commit_id': commit.id,
+                'message': self.commit_message,
+            })
+        except Exception as e:
+            _logger.error("Failed to create and publish Nostr event: %s", str(e))
+            return {
+                'type': 'ir.actions.client',
+                'tag': 'display_notification',
+                'params': {
+                    'title': _("Warning"),
+                    'message': _("Commit created, but failed to publish Nostr event: %s") % str(e),
+                    'type': 'warning',
+                }
+            }
+    
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': _("Success"),
+                'message': _("Commit created and Nostr event published successfully"),
+                'type': 'success',
+            }
+        }
+=== ./wizards/create_branch_wizard.py ===
+from odoo import models, fields, api
+
+class CreateBranchWizard(models.TransientModel):
+    _name = 'gitlab_nostr_bridge.create.branch.wizard'
+    _description = 'Create Branch Wizard'
+
+    repository_id = fields.Many2one('gitlab.repository', string='Repository', required=True)
+    branch_name = fields.Char(string='Branch Name', required=True)
+    branch_name = fields.Char(string='Branch Name', required=True)
+    source_branch = fields.Char(string='Source Branch', default='master')
+
+    def action_create_branch(self):
+        self.ensure_one()
+        gl = gitlab.Gitlab(self.repository_id.url, private_token=self.env['ir.config_parameter'].sudo().get_param('gitlab.private_token'))
+        project = gl.projects.get(self.repository_id.project_id)
+        branch = project.branches.create({'branch': self.branch_name, 'ref': self.source_branch})
+        
+        self.env['gitlab.branch'].create_or_update_from_gitlab(self.repository_id.id, branch)
+        
+        self.env['nostr.event'].create_gitlab_event('branch', {
+            'project_id': self.repository_id.project_id,
+            'branch_name': self.branch_name,
+            'action': 'create',
+        })
+        
+        return {'type': 'ir.actions.act_window_close'}
+=== ./wizards/create_branch_wizard_views.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_create_branch_wizard_form" model="ir.ui.view">
+        <field name="name">gitlab_nostr_bridge.create.branch.wizard.form</field>
+        <field name="model">gitlab_nostr_bridge.create.branch.wizard</field>
+        <field name="arch" type="xml">
+            <form string="Create Branch">
+                <group>
+                    <field name="repository_id"/>
+                    <field name="branch_name"/>
+                </group>
+                <footer>
+                    <button name="action_create_branch" string="Create Branch" type="object" class="btn-primary"/>
+                    <button string="Cancel" class="btn-secondary" special="cancel"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_create_branch_wizard" model="ir.actions.act_window">
+        <field name="name">Create Branch</field>
+        <field name="res_model">gitlab_nostr_bridge.create.branch.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+    </record>
+</odoo>
+=== ./__manifest__.py ===
+{
+    'name': 'GitLab-Nostr Bridge',
+    'version': '1.2.0',
+    'category': 'Productivity/Integrations',
+    'summary': 'Integrate GitLab repositories with Nostr events',
+    'sequence': 1,
+    'author': 'Your Company',
+    'website': 'https://www.yourcompany.com',
+    'license': 'LGPL-3',
+    'description': """
+GitLab-Nostr Bridge
+===================
+This module integrates GitLab repositories with Nostr events, allowing you to:
+* Sync GitLab repositories, branches, and commits with Odoo
+* Generate Nostr events for GitLab activities
+* Publish Nostr events to configured relays
+* Manage Nostr keys for users
+* Configure GitLab and Nostr settings
+
+Key Features:
+-------------
+* GitLab repository synchronization
+* Nostr event generation and publication
+* Multiple publishing strategies (original, alternative, and new relay management)
+* User-specific Nostr key management
+* Configurable GitLab and Nostr settings
+* Automated relay testing and management
+    """,
+    'depends': [
+        'base',
+        'mail',
+        'web',
+    ],
+    'data': [
+        'security/ir.model.access.csv',
+        'views/gitlab_repository_views.xml',
+        'views/gitlab_branch_views.xml',
+        'views/gitlab_commit_views.xml',
+        'views/nostr_event_views.xml',
+        'views/res_users_views.xml',
+        'views/res_config_settings_views.xml',
+        'data/gitlab_nostr_bridge_data.xml',
+        'data/ir_cron_data.xml',
+    ],
+    'demo': [],
+    'css': [
+        'static/src/css/gitlab_nostr_bridge.css',
+    ],
+    'images': [
+        'static/description/icon.png',
+    ],
+    'assets': {
+        'web.assets_backend': [
+            'gitlab_nostr_bridge/static/src/js/gitlab_nostr_bridge.js',
+        ],
+    },
+    'external_dependencies': {
+        'python': [
+            'gitlab',
+            'nostr',
+            'requests',
+            'websockets',
+        ],
+    },
+    'application': True,
+    'installable': True,
+    'auto_install': False,
+    'uninstall_hook': 'uninstall_hook',
+}
+=== ./allfiles.txt ===
+=== ./security/ir.model.access.csv ===
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_gitlab_repository_user,gitlab.repository user,model_gitlab_repository,base.group_user,1,1,1,1
+access_gitlab_branch_user,gitlab.branch user,model_gitlab_branch,base.group_user,1,1,1,1
+access_gitlab_commit_user,gitlab.commit user,model_gitlab_commit,base.group_user,1,1,1,1
+access_nostr_event_user,nostr.event user,model_nostr_event,base.group_user,1,1,1,1
+access_create_branch_wizard_user,create.branch.wizard user,model_gitlab_nostr_bridge_create_branch_wizard,base.group_user,1,1,1,0
+access_create_commit_wizard_user,create.commit.wizard user,model_gitlab_nostr_bridge_create_commit_wizard,base.group_user,1,1,1,0
+=== ./data/gitlab_nostr_bridge_data.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data noupdate="1">
+        <record id="gitlab_private_token" model="ir.config_parameter">
+            <field name="key">gitlab.private_token</field>
+            <field name="value">your_gitlab_private_token_here</field>
+        </record>
+    </data>
+</odoo>
+=== ./data/ir_cron_data.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data noupdate="1">
+        <!-- Scheduled action for syncing GitLab repositories -->
+        <record id="ir_cron_sync_gitlab_repositories" model="ir.cron">
+            <field name="name">Sync GitLab Repositories</field>
+            <field name="model_id" ref="model_gitlab_repository"/>
+            <field name="state">code</field>
+            <field name="code">model.sync_all_repositories()</field>
+            <field name="interval_number">1</field>
+            <field name="interval_type">hours</field>
+            <field name="numbercall">-1</field>
+            <field name="doall" eval="False"/>
+            <field name="active" eval="True"/>
+        </record>
+
+        <!-- Scheduled action for processing incoming Nostr events -->
+        <record id="ir_cron_process_nostr_events" model="ir.cron">
+            <field name="name">Process Incoming Nostr Events</field>
+            <field name="model_id" ref="model_nostr_event"/>
+            <field name="state">code</field>
+            <field name="code">model.process_incoming_events()</field>
+            <field name="interval_number">5</field>
+            <field name="interval_type">minutes</field>
+            <field name="numbercall">-1</field>
+            <field name="doall" eval="False"/>
+            <field name="active" eval="True"/>
+        </record>
+
+        <!-- New scheduled action for testing and updating Nostr relays -->
+        <record id="ir_cron_test_and_update_nostr_relays" model="ir.cron">
+            <field name="name">Test and Update Nostr Relays</field>
+            <field name="model_id" ref="model_nostr_relay_tester"/>
+            <field name="state">code</field>
+            <field name="code">model._test_and_update_relays()</field>
+            <field name="user_id" ref="base.user_root"/>
+            <field name="interval_number">6</field>
+            <field name="interval_type">hours</field>
+            <field name="numbercall">-1</field>
+            <field name="doall" eval="False"/>
+            <field name="active" eval="True"/>
+        </record>
+    </data>
+</odoo>
+=== ./views/res_users_views.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_users_form_inherit_nostr" model="ir.ui.view">
+        <field name="name">res.users.form.inherit.nostr</field>
+        <field name="model">res.users</field>
+        <field name="inherit_id" ref="base.view_users_form"/>
+        <field name="arch" type="xml">
+            <notebook position="inside">
+                <page string="Nostr Settings" name="nostr_settings">
+                    <group>
+                        <field name="nostr_private_key" password="True" readonly="1"/>
+                        <field name="nostr_public_key" readonly="1"/>
+                        <button name="action_generate_nostr_key" string="Generate New Nostr Key Pair" type="object" class="oe_highlight"/>
+                        <button name="action_clear_nostr_key" string="Clear Nostr Key Pair" type="object" class="btn-secondary"/>
+                    </group>
+                </page>
+                <page string="Key Management" name="nostr_key_management">
+                    <group>
+                        <field name="nostr_private_key" password="True" readonly="1"/>
+                        <field name="nostr_public_key" readonly="1"/>
+                        <button name="action_generate_nostr_key" string="Generate New Nostr Key Pair" type="object" class="oe_highlight"/>
+                        <button name="action_clear_nostr_key" string="Clear Nostr Key Pair" type="object" class="btn-secondary"/>
+                    </group>
+                </page>
+            </notebook>
+        </field>
+    </record>
+</odoo>
+=== ./views/gitlab_commit_views.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_gitlab_commit_form" model="ir.ui.view">
+        <field name="name">gitlab.commit.form</field>
+        <field name="model">gitlab.commit</field>
+        <field name="arch" type="xml">
+            <form>
+                <sheet>
+                    <group>
+                        <field name="name"/>
+                        <field name="message"/>
+                        <field name="author"/>
+                        <field name="date"/>
+                        <field name="repository_id"/>
+                    </group>
+                    <notebook>
+                        <page string="Branches">
+                            <field name="branch_ids"/>
+                        </page>
+                    </notebook>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="view_gitlab_commit_tree" model="ir.ui.view">
+        <field name="name">gitlab.commit.tree</field>
+        <field name="model">gitlab.commit</field>
+        <field name="arch" type="xml">
+            <tree>
+                <field name="name"/>
+                <field name="message"/>
+                <field name="author"/>
+                <field name="date"/>
+                <field name="repository_id"/>
+            </tree>
+        </field>
+    </record>
+
+    <record id="action_gitlab_commit" model="ir.actions.act_window">
+        <field name="name">GitLab Commits</field>
+        <field name="res_model">gitlab.commit</field>
+        <field name="view_mode">tree,form</field>
+    </record>
+
+    <menuitem id="menu_gitlab_commit" name="Commits" parent="menu_gitlab_nostr_bridge" action="action_gitlab_commit" sequence="30"/>
+</odoo>
+=== ./views/gitlab_repository_views.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_gitlab_repository_form" model="ir.ui.view">
+        <field name="name">gitlab.repository.form</field>
+        <field name="model">gitlab.repository</field>
+        <field name="arch" type="xml">
+            <form>
+                <header>
+                    <button name="sync_with_gitlab" string="Sync with GitLab" type="object" class="oe_highlight"/>
+                    <button name="action_create_commit" string="Create Commit" type="object" class="oe_highlight"/>
+                </header>
+                <sheet>
+                    <group>
+                        <field name="name"/>
+                        <field name="gitlab_id"/>
+                        <field name="url"/>
+                        <field name="project_id"/>
+                    </group>
+                    <notebook>
+                        <page string="Branches">
+                            <field name="branch_ids"/>
+                        </page>
+                        <page string="Commits">
+                            <field name="commit_ids"/>
+                        </page>
+                    </notebook>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="view_gitlab_repository_tree" model="ir.ui.view">
+        <field name="name">gitlab.repository.tree</field>
+        <field name="model">gitlab.repository</field>
+        <field name="arch" type="xml">
+            <tree>
+                <field name="name"/>
+                <field name="gitlab_id"/>
+                <field name="url"/>
+                <field name="project_id"/>
+            </tree>
+        </field>
+    </record>
+
+    <record id="action_gitlab_repository" model="ir.actions.act_window">
+        <field name="name">GitLab Repositories</field>
+        <field name="res_model">gitlab.repository</field>
+        <field name="view_mode">tree,form</field>
+    </record>
+
+    <menuitem id="menu_gitlab_nostr_bridge" name="GitLab-Nostr Bridge" sequence="10"/>
+    <menuitem id="menu_gitlab_repository" name="Repositories" parent="menu_gitlab_nostr_bridge" action="action_gitlab_repository" sequence="10"/>
+</odoo>
+=== ./views/res_config_settings_views.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <record id="res_config_settings_view_form" model="ir.ui.view">
+            <field name="name">res.config.settings.view.form.inherit.gitlab.nostr.bridge</field>
+            <field name="model">res.config.settings</field>
+            <field name="priority" eval="70"/>
+            <field name="inherit_id" ref="base.res_config_settings_view_form"/>
+            <field name="arch" type="xml">
+                <xpath expr="//div[hasclass('settings')]" position="inside">
+                    <div class="app_settings_block" data-string="GitLab-Nostr Bridge" string="GitLab-Nostr Bridge" data-key="gitlab_nostr_bridge">
+                        <h2>GitLab Settings</h2>
+                        <div class="row mt16 o_settings_container" name="gitlab_settings">
+                            <div class="col-12 col-lg-6 o_setting_box">
+                                <div class="o_setting_left_pane"/>
+                                <div class="o_setting_right_pane">
+                                    <span class="o_form_label">GitLab URL</span>
+                                    <div class="text-muted">
+                                        Enter your GitLab server URL
+                                    </div>
+                                    <div class="content-group">
+                                        <div class="mt16">
+                                            <field name="gitlab_url" class="o_field_widget oe_inline" placeholder="e.g. https://gitlab.com"/>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-12 col-lg-6 o_setting_box">
+                                <div class="o_setting_left_pane"/>
+                                <div class="o_setting_right_pane">
+                                    <span class="o_form_label">GitLab Private Token</span>
+                                    <div class="text-muted">
+                                        Enter your GitLab private token for API access
+                                    </div>
+                                    <div class="content-group">
+                                        <div class="mt16">
+                                            <field name="gitlab_private_token" password="True" class="o_field_widget oe_inline"/>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="row mt16 o_settings_container">
+                            <div class="col-12 col-lg-6 o_setting_box">
+                                <div class="o_setting_left_pane"/>
+                                <div class="o_setting_right_pane">
+                                    <button name="test_gitlab_connection" type="object" string="Test GitLab Connection" class="btn-primary"/>
+                                    <button name="action_clear_gitlab_token" type="object" string="Clear GitLab Token" class="btn-secondary"/>
+                                </div>
+                            </div>
+                        </div>
+                        <h2>Nostr Settings</h2>
+                        <div class="row mt16 o_settings_container" name="nostr_settings">
+                            <div class="col-12 col-lg-6 o_setting_box">
+                                <div class="o_setting_left_pane">
+                                    <field name="use_alternative_publish"/>
+                                </div>
+                                <div class="o_setting_right_pane">
+                                    <label for="use_alternative_publish"/>
+                                    <div class="text-muted">
+                                        Use alternative publish method for Nostr events
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-12 col-lg-6 o_setting_box">
+                                <div class="o_setting_left_pane">
+                                    <field name="use_new_relay_management"/>
+                                </div>
+                                <div class="o_setting_right_pane">
+                                    <label for="use_new_relay_management"/>
+                                    <div class="text-muted">
+                                        Use new relay management system
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-12 col-lg-6 o_setting_box">
+                                <div class="o_setting_left_pane"/>
+                                <div class="o_setting_right_pane">
+                                    <span class="o_form_label">Nostr Relay URLs</span>
+                                    <div class="text-muted">
+                                        Enter comma-separated Nostr relay URLs
+                                    </div>
+                                    <div class="content-group">
+                                        <div class="mt16">
+                                            <field name="nostr_relay_urls" class="o_field_widget oe_inline" placeholder="e.g. wss://relay1.com,wss://relay2.com"/>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="row mt16 o_settings_container">
+                            <div class="col-12 col-lg-6 o_setting_box">
+                                <div class="o_setting_left_pane"/>
+                                <div class="o_setting_right_pane">
+                                    <button name="test_nostr_connection" type="object" string="Test Nostr Connection" class="btn-primary"/>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </xpath>
+            </field>
+        </record>
+    </data>
+</odoo>
+=== ./views/nostr_event_views.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_nostr_event_form" model="ir.ui.view">
+        <field name="name">nostr.event.form</field>
+        <field name="model">nostr.event</field>
+        <field name="arch" type="xml">
+            <form>
+                <header>
+                    <button name="action_publish" string="Publish Event" type="object" class="oe_highlight"/>
+                </header>
+                <sheet>
+                    <group>
+                        <field name="event_id"/>
+                        <field name="kind"/>
+                        <field name="content"/>
+                        <field name="tags"/>
+                        <field name="public_key"/>
+                        <field name="created_at"/>
+                        <field name="signature"/>
+                        <field name="published"/>
+                        <field name="logs"/>
+                    </group>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="view_nostr_event_tree" model="ir.ui.view">
+        <field name="name">nostr.event.tree</field>
+        <field name="model">nostr.event</field>
+        <field name="arch" type="xml">
+            <tree>
+                <field name="event_id"/>
+                <field name="kind"/>
+                <field name="public_key"/>
+                <field name="created_at"/>
+            </tree>
+        </field>
+    </record>
+
+    <record id="action_nostr_event" model="ir.actions.act_window">
+        <field name="name">Nostr Events</field>
+        <field name="res_model">nostr.event</field>
+        <field name="view_mode">tree,form</field>
+    </record>
+
+    <menuitem id="menu_nostr_event" name="Nostr Events" parent="menu_gitlab_nostr_bridge" action="action_nostr_event" sequence="40"/>
+</odoo>
+=== ./views/gitlab_branch_views.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_gitlab_branch_form" model="ir.ui.view">
+        <field name="name">gitlab.branch.form</field>
+        <field name="model">gitlab.branch</field>
+        <field name="arch" type="xml">
+            <form>
+                <sheet>
+                    <group>
+                        <field name="name"/>
+                        <field name="repository_id"/>
+                        <field name="last_commit_date"/>
+                    </group>
+                    <notebook>
+                        <page string="Commits">
+                            <field name="commit_ids"/>
+                        </page>
+                    </notebook>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="view_gitlab_branch_tree" model="ir.ui.view">
+        <field name="name">gitlab.branch.tree</field>
+        <field name="model">gitlab.branch</field>
+        <field name="arch" type="xml">
+            <tree>
+                <field name="name"/>
+                <field name="repository_id"/>
+                <field name="last_commit_date"/>
+            </tree>
+        </field>
+    </record>
+
+    <record id="action_gitlab_branch" model="ir.actions.act_window">
+        <field name="name">GitLab Branches</field>
+        <field name="res_model">gitlab.branch</field>
+        <field name="view_mode">tree,form</field>
+    </record>
+
+    <menuitem id="menu_gitlab_branch" name="Branches" parent="menu_gitlab_nostr_bridge" action="action_gitlab_branch" sequence="20"/>
+</odoo>

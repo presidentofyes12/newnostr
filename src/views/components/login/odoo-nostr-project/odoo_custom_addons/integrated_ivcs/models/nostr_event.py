@@ -31,18 +31,27 @@ class NostrEvent(models.Model):
     ], string='Event Type')
 
     def create_and_publish(self, event):
-        vals = {
-            'event_id': event.id,
-            'kind': event.kind,
-            'content': event.content,
-            'tags': json.dumps(event.tags),
-            'public_key': event.public_key,
-            'created_at': event.created_at,
-            'signature': event.signature,
-        }
-        nostr_event = self.create(vals)
-        nostr_event.publish_event()
-        return nostr_event
+        event_model = self._get_event_model(event.kind)
+        if event_model:
+            nostr_event = event_model.from_json(event.to_json())
+            nostr_event.publish_event()
+            return nostr_event
+        else:
+            return super(NostrEvent, self).create_and_publish(event)
+
+    def _get_event_model(self, kind):
+        if kind == 31228:
+            return self.env['nostr.event.repository.anchor']
+        elif kind == 31227:
+            return self.env['nostr.event.branch']
+        elif kind == 3121:
+            return self.env['nostr.event.commit']
+        elif kind == 3122:
+            return self.env['nostr.event.tree']
+        elif kind == 3123:
+            return self.env['nostr.event.blob']
+        else:
+            return None
 
     def publish_event(self):
         self.ensure_one()
@@ -73,31 +82,23 @@ class NostrEvent(models.Model):
         repo = git.Repo(repo_path)
         commit = repo.commit(commit_hash)
         
-        content = json.dumps({
-            "action": "commit",
-            "message": commit.message,
-            "author": commit.author.name,
-            "email": commit.author.email,
-            "date": commit.authored_datetime.isoformat(),
-            "hash": commit_hash,
-            "parent_hashes": [c.hexsha for c in commit.parents],
-            "tree_hash": commit.tree.hexsha,
+        commit_event = self.env['nostr.event.commit'].create({
+            'id': commit_hash,  # Using commit hash as event ID
+            'pubkey': self.env.user.nostr_public_key,
+            'sig': 'placeholder',  # This should be properly signed
+            'commit_hash': commit_hash,
+            'message': commit.message,
+            'author': f"{commit.author.name} <{commit.author.email}>",
+            'timestamp': commit.committed_datetime.isoformat(),
+            'content': json.dumps({
+                'hash': commit_hash,
+                'message': commit.message,
+                'author': f"{commit.author.name} <{commit.author.email}>",
+                'date': commit.committed_datetime.isoformat(),
+            })
         })
         
-        event = Event(
-            kind=3121,
-            content=content,
-            tags=[
-                ["r", repo_path],
-                ["h", commit_hash],
-            ],
-            public_key=self.env.user.nostr_public_key,
-        )
-        
-        private_key = PrivateKey(bytes.fromhex(self.env.user.nostr_private_key))
-        private_key.sign_event(event)
-        
-        return self.create_and_publish(event)
+        return commit_event
 
     @api.model
     def create_tree_event(self, repo_path, tree_hash):

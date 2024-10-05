@@ -16,11 +16,15 @@
         'views/res_config_settings_views.xml',
         'wizards/create_branch_wizard_views.xml',
         'wizards/create_commit_wizard_views.xml',
+        'models/nostr_events.py',
     ],
+    'demo': [],
     'external_dependencies': {
         'python': ['git', 'nostr'],
     },
     'installable': True,
     'application': True,
     'auto_install': False,
+    'post_init_hook': 'post_init_hook',
+    'uninstall_hook': 'uninstall_hook',
 }
